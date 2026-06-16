@@ -19,7 +19,7 @@ We're building the map.
 ## Quick start
 
 ```bash
-git clone https://github.com/yourusername/mcp-threat-intel
+git clone https://github.com/shivakant2410/mcp-threat-intel
 cd mcp-threat-intel
 pip install -r requirements.txt
 
@@ -128,7 +128,7 @@ The gap between what an MCP server claims and what it does is the security bound
 
 Found a malicious MCP server? Open an issue with the package name and behavioral evidence. We'll analyze it and add it to the dataset.
 
-Security researchers: the full sandbox analysis JSON is available on request. Email [your email].
+Security researchers: the full sandbox analysis JSON is available on request. Email: work.shiva08@gmail.com.
 
 ---
 
