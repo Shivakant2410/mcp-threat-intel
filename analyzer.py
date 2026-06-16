@@ -312,28 +312,85 @@ def generate_threat_report(reports, output_file=None):
 
 
 if __name__ == "__main__":
-    # Load batch results and run deviation analysis
-    batch_file = Path(__file__).parent / "data" / "sandbox_results" / "batch_results.json"
+    import sys
+
+    # Load results — try batch file first, then scan individual files
+    sandbox_dir = Path(__file__).parent / "data" / "sandbox_results"
+    results = []
+
+    # Option 1: batch_results.json
+    batch_file = sandbox_dir / "batch_results.json"
     if batch_file.exists():
         with open(batch_file) as f:
             results = json.load(f)
-
-        reports = []
-        for result in results:
-            report = analyze_package(result)
-            reports.append(report)
-
-        threat_report = generate_threat_report(reports)
-
-        s = threat_report["summary"]
-        print(f"THREAT INTELLIGENCE REPORT")
-        print(f"{'=' * 40}")
-        print(f"Total analyzed: {s['total_analyzed']}")
-        print(f"Exploitable:    {s['exploitable']}")
-        print(f"Suspicious:     {s['suspicious']}")
-        print(f"Moderate:       {s['moderate']}")
-        print(f"Low risk:       {s['low_risk']}")
-        print(f"Critical devs:  {s['total_critical_deviations']}")
-        print(f"High devs:      {s['total_high_deviations']}")
+        print(f"Loaded {len(results)} results from batch_results.json")
     else:
-        print("No batch results found. Run sandbox.py batch analysis first.")
+        # Option 2: scan individual result files
+        seen = set()
+        for sf in sandbox_dir.glob("*.json"):
+            if sf.name == "batch_results.json":
+                continue
+            try:
+                with open(sf) as f:
+                    data = json.load(f)
+                pkg_name = data.get("package", "")
+                if pkg_name and pkg_name not in seen:
+                    results.append(data)
+                    seen.add(pkg_name)
+            except (json.JSONDecodeError, IOError):
+                pass
+        if results:
+            print(f"Loaded {len(results)} results from individual sandbox files")
+
+    if not results:
+        print("No sandbox results found. Run: python sandbox.py --batch")
+        sys.exit(1)
+
+    # Load index for package metadata
+    index_file = Path(__file__).parent / "data" / "index.json"
+    meta_lookup = {}
+    if index_file.exists():
+        with open(index_file) as f:
+            index = json.load(f)
+        for pkg in index:
+            meta_lookup[pkg["name"]] = pkg
+
+    # Run deviation analysis
+    reports = []
+    for result in results:
+        meta = meta_lookup.get(result.get("package", ""), None)
+        report = analyze_package(result, meta)
+        reports.append(report)
+
+    threat_report = generate_threat_report(reports)
+
+    s = threat_report["summary"]
+    print(f"\nTHREAT INTELLIGENCE REPORT")
+    print(f"{'=' * 50}")
+    print(f"Total analyzed: {s['total_analyzed']}")
+    print(f"Exploitable:    {s['exploitable']}")
+    print(f"Suspicious:     {s['suspicious']}")
+    print(f"Moderate:       {s['moderate']}")
+    print(f"Low risk:       {s['low_risk']}")
+    print(f"Critical devs:  {s['total_critical_deviations']}")
+    print(f"High devs:      {s['total_high_deviations']}")
+
+    # Also save a human-readable summary
+    summary_file = Path(__file__).parent / "data" / "reports" / "summary.txt"
+    summary_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(summary_file, "w") as f:
+        f.write(f"MCP THREAT INTELLIGENCE REPORT\n")
+        f.write(f"{'=' * 50}\n")
+        f.write(f"Generated: {s['generated_at'][:10]}\n")
+        f.write(f"Total analyzed: {s['total_analyzed']}\n")
+        f.write(f"Exploitable:    {s['exploitable']} ({s['exploitable']*100//s['total_analyzed']}%)\n")
+        f.write(f"Suspicious:     {s['suspicious']}\n")
+        f.write(f"Moderate:       {s['moderate']}\n")
+        f.write(f"Low risk:       {s['low_risk']}\n\n")
+        f.write(f"TOP RISKS:\n")
+        for pkg in threat_report["packages"][:10]:
+            dev = pkg["deviation_analysis"]
+            f.write(f"  {pkg['package']}: {dev['deviation_score']} ({dev['risk_assessment']})\n")
+            for d in dev["deviations"][:3]:
+                f.write(f"    [{d['severity']}] {d['type']}\n")
+    print(f"\nSummary saved to {summary_file}")

@@ -11,11 +11,15 @@ Since Docker may not be available, we also support a static analysis mode
 that inspects package contents without executing them.
 """
 
+import io
 import json
 import os
 import re
 import subprocess
+import tarfile
 import tempfile
+import urllib.request
+import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -23,48 +27,98 @@ DATA_DIR = Path(__file__).parent / "data"
 SANDBOX_DIR = DATA_DIR / "sandbox_results"
 SANDBOX_DIR.mkdir(parents=True, exist_ok=True)
 
+# ============================================================
+# CLEANUP — remove old sandbox results before batch run
+# ============================================================
+for f in SANDBOX_DIR.glob("*.json"):
+    try:
+        f.unlink()
+    except Exception as e:
+        print(f"⚠️ Could not delete {f}: {e}")
 
+        
 # ============================================================
 # STATIC ANALYSIS — Inspect package without running it
 # ============================================================
 
 def download_npm_package(name, version="latest", output_dir=None):
-    """Download an npm package tarball without installing dependencies."""
+    """Download an npm package tarball and extract it. Cross-platform (no tar CLI needed)."""
     if output_dir is None:
         output_dir = tempfile.mkdtemp(prefix="mcp_sandbox_")
 
-    pkg_dir = os.path.join(output_dir, name.replace("/", "_"))
+    pkg_dir = os.path.join(output_dir, name.replace("/", "_").replace("@", ""))
     os.makedirs(pkg_dir, exist_ok=True)
 
-    # Use npm pack to get the tarball
+    extract_dir = os.path.join(pkg_dir, "contents")
+    os.makedirs(extract_dir, exist_ok=True)
+
+    # Method 1: Download tarball directly from npm registry via HTTP
+    # Works on all platforms, no npm CLI needed
+    try:
+        # Resolve "latest" to actual version first
+        if version == "latest":
+            meta_url = f"https://registry.npmjs.org/{name}/latest"
+            req = urllib.request.Request(meta_url, headers={"User-Agent": "mcp-threat-intel/0.1"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                meta = json.loads(resp.read().decode())
+                version = meta.get("version", "latest")
+
+        # Download tarball
+        tarball_url = f"https://registry.npmjs.org/{name}/-/{name.split('/')[-1]}-{version}.tgz"
+        req = urllib.request.Request(tarball_url, headers={"User-Agent": "mcp-threat-intel/0.1"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            tgz_data = resp.read()
+
+        # Extract using Python's tarfile (no external tar command)
+        with tarfile.open(fileobj=io.BytesIO(tgz_data), mode='r:gz') as tar:
+            # Security: filter out absolute paths and path traversal
+            members = [m for m in tar.getmembers()
+                       if not m.name.startswith('/') and '..' not in m.name]
+            tar.extractall(path=extract_dir, members=members, filter='data')
+
+        # Verify something was extracted
+        if any(Path(extract_dir).iterdir()):
+            return extract_dir
+
+    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError,
+            tarfile.TarError, OSError, Exception) as e:
+        print(f"  [HTTP] Registry download failed: {e}")
+
+    # Method 2: Fallback to npm pack + Python tarfile
     try:
         result = subprocess.run(
             ["npm", "pack", f"{name}@{version}", "--pack-destination", pkg_dir],
             capture_output=True, text=True, timeout=60
         )
         if result.returncode != 0:
+            print(f"  [npm] pack failed: {result.stderr.strip()[:100]}")
             return None
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return None
 
-    # Extract the tarball
-    tgz_files = list(Path(pkg_dir).glob("*.tgz"))
-    if not tgz_files:
-        return None
+        tgz_files = list(Path(pkg_dir).glob("*.tgz"))
+        if not tgz_files:
+            print(f"  [npm] No tarball found after pack")
+            return None
 
-    extract_dir = os.path.join(pkg_dir, "contents")
-    os.makedirs(extract_dir, exist_ok=True)
+        with tarfile.open(str(tgz_files[0]), 'r:gz') as tar:
+            members = [m for m in tar.getmembers()
+                       if not m.name.startswith('/') and '..' not in m.name]
+            tar.extractall(path=extract_dir, members=members, filter='data')
 
+        if any(Path(extract_dir).iterdir()):
+            return extract_dir
+
+    except (subprocess.TimeoutExpired, FileNotFoundError, tarfile.TarError, OSError) as e:
+        print(f"  [npm] Fallback failed: {e}")
+
+    return None
+
+def safe_load_json(path):
     try:
-        subprocess.run(
-            ["tar", "-xzf", str(tgz_files[0]), "-C", extract_dir],
-            capture_output=True, timeout=30
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"⚠️ Failed to load {path}: {e}")
         return None
-
-    return extract_dir
-
 
 def analyze_package_contents(extract_dir):
     """Static analysis of package contents — look for red flags."""
@@ -95,18 +149,16 @@ def analyze_package_contents(extract_dir):
 
     # Analyze package.json for declared capabilities
     for jf in json_files:
-        if jf.name == "package.json":
-            try:
-                with open(jf) as f:
-                    pkg_data = json.load(f)
-                findings["declared_capabilities"].append({
-                    "file": str(jf.relative_to(package_dir)),
-                    "dependencies": list(pkg_data.get("dependencies", {}).keys()),
-                    "scripts": pkg_data.get("scripts", {}),
-                    "main": pkg_data.get("main", ""),
-                })
-            except (json.JSONDecodeError, IOError):
-                pass
+     if jf.name == "package.json":
+        pkg_data = safe_load_json(jf)
+        if pkg_data:
+            findings["declared_capabilities"].append({
+                "file": str(jf.relative_to(package_dir)),
+                "dependencies": list(pkg_data.get("dependencies", {}).keys()),
+                "scripts": pkg_data.get("scripts", {}),
+                "main": pkg_data.get("main", ""),
+            })
+
 
     # Patterns to search for in code
     patterns = {
@@ -374,10 +426,58 @@ def batch_analyze(packages, limit=20):
 
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) > 1:
+    if "--batch" in sys.argv:
+        # Batch mode: analyze N packages from index
+        limit = 50
+        for i, arg in enumerate(sys.argv):
+            if arg == "--limit" and i + 1 < len(sys.argv):
+                limit = int(sys.argv[i + 1])
+
+        # Load index
+        index_file = Path(__file__).parent / "data" / "index.json"
+        if not index_file.exists():
+            print("No index found. Run crawler.py first.")
+            sys.exit(1)
+
+        with open(index_file) as f:
+            index = json.load(f)
+
+        npm_pkgs = [p for p in index if p.get("source") == "npm"]
+        print(f"[BATCH] {len(npm_pkgs)} npm packages in index, analyzing up to {limit}...")
+
+        # Check which are already analyzed
+        already = set()
+        for sf in SANDBOX_DIR.glob("*.json"):
+            if sf.name != "batch_results.json":
+                already.add(sf.stem)
+        print(f"[BATCH] {len(already)} already analyzed, skipping those")
+
+        to_analyze = []
+        for pkg in npm_pkgs:
+            safe_name = pkg["name"].replace("/", "_").replace("@", "")
+            if safe_name not in already:
+                to_analyze.append(pkg)
+            if len(to_analyze) >= limit:
+                break
+
+        print(f"[BATCH] Analyzing {len(to_analyze)} new packages...")
+        results = batch_analyze(to_analyze, limit=limit)
+
+        # Also run analyzer automatically after batch
+        print(f"\n{'=' * 60}")
+        print(f"Running deviation analysis...")
+        print(f"{'=' * 60}")
+        os.system(f"{sys.executable} analyzer.py")
+
+    elif len(sys.argv) > 1:
         pkg_name = sys.argv[1]
         version = sys.argv[2] if len(sys.argv) > 2 else "latest"
         analyze_npm_package(pkg_name, version)
     else:
-        print("Usage: python sandbox.py <package-name> [version]")
-        print("       python sandbox.py @modelcontextprotocol/server-filesystem latest")
+        print("Usage:")
+        print("  python sandbox.py <package-name> [version]   Analyze a single package")
+        print("  python sandbox.py --batch [--limit N]         Batch analyze from index")
+        print()
+        print("Examples:")
+        print("  python sandbox.py @modelcontextprotocol/server-filesystem latest")
+        print("  python sandbox.py --batch --limit 50")
